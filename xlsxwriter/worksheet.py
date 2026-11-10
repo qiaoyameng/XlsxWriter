@@ -271,6 +271,23 @@ CellArrayFormulaTuple = namedtuple(
 ###############################################################################
 
 
+def _rectangles_overlap(
+    first_row: int,
+    first_col: int,
+    last_row: int,
+    last_col: int,
+    other: tuple,
+) -> bool:
+    # Return True if two inclusive (first_row, first_col, last_row, last_col)
+    # rectangles share at least one cell.
+    return not (
+        last_row < other[0]
+        or first_row > other[2]
+        or last_col < other[1]
+        or first_col > other[3]
+    )
+
+
 @dataclass
 class ColumnInfo:
     """Type to hold user modified properties for a column."""
@@ -292,6 +309,18 @@ class RowInfo:
     hidden: bool = False
     level: int = 0
     collapsed: bool = False
+
+
+@dataclass
+class StreamTable:
+    """Type to hold a pre-declared table in constant_memory mode."""
+
+    first_row: int
+    first_col: int
+    last_row: int
+    last_col: int
+    table: dict
+    total_cells: dict
 
 
 ###############################################################################
@@ -425,6 +454,10 @@ class Worksheet(xmlwriter.XMLwriter):
         self.merge = []
         self.merged_cells = {}
         self.table_cells = {}
+        # Pre-declared constant_memory table ranges, stored as compact
+        # (first_row, first_col, last_row, last_col, cell_range) tuples so
+        # that memory stays independent of the number of data rows.
+        self.stream_table_ranges = []
         self.row_spans = {}
 
         self.has_vml = False
@@ -467,6 +500,7 @@ class Worksheet(xmlwriter.XMLwriter):
         self.charts = []
         self.images = []
         self.tables = []
+        self.stream_tables = []
         self.sparklines = []
         self.shapes = []
         self.shape_hash = {}
@@ -2506,6 +2540,17 @@ class Worksheet(xmlwriter.XMLwriter):
 
                 self.merged_cells[(row, col)] = cell_range
 
+        # Check pre-declared constant_memory table ranges, which are stored
+        # as compact rectangles rather than per-cell entries.
+        for other in self.stream_table_ranges:
+            if _rectangles_overlap(
+                first_row, first_col, last_row, last_col, other
+            ):
+                raise OverlappingRange(
+                    f"Merge range '{cell_range}' overlaps previous table "
+                    f"range '{other[4]}'."
+                )
+
         # Store the merge range.
         self.merge.append([first_row, first_col, last_row, last_col])
 
@@ -3468,6 +3513,11 @@ class Worksheet(xmlwriter.XMLwriter):
         """
         Add an Excel table to a worksheet.
 
+        In ``constant_memory`` mode the table must be pre-declared before any
+        of the data rows it spans have been written (see
+        ``add_table_stream()``). The ``data`` and calculated column
+        ``formula`` options aren't supported in that mode.
+
         Args:
             first_row:    The first row of the cell range. (zero indexed).
             first_col:    The first column of the cell range.
@@ -3479,8 +3529,13 @@ class Worksheet(xmlwriter.XMLwriter):
             0:  Success.
             -1: Row or column is out of worksheet bounds.
             -2: Incorrect parameter or option.
-            -3: Not supported in constant_memory mode.
+            -3: Reserved.
         """
+        if self.constant_memory:
+            return self._add_stream_table(
+                first_row, first_col, last_row, last_col, options
+            )
+
         table = {}
         col_formats = {}
 
@@ -3489,10 +3544,6 @@ class Worksheet(xmlwriter.XMLwriter):
         else:
             # Copy the user defined options so they aren't modified.
             options = options.copy()
-
-        if self.constant_memory:
-            warn("add_table() isn't supported in 'constant_memory' mode")
-            return -3
 
         # Check that row and col are valid without storing the values.
         if self._check_dimensions(first_row, first_col, True, True):
@@ -3819,6 +3870,405 @@ class Worksheet(xmlwriter.XMLwriter):
                 self.filter_cells[(first_row, col)] = ("table", cell_range)
 
         return 0
+
+    @convert_range_args
+    def add_table_stream(
+        self,
+        first_row: int,
+        first_col: int,
+        last_row: int,
+        last_col: int,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Literal[0, -1, -2, -3]:
+        """
+        Pre-declare an Excel table in ``constant_memory`` mode.
+
+        The table structure (name, columns, style, autofilter and totals row)
+        is declared before any of the rows it covers have been written. The
+        caller then writes the data rows one at a time with the standard
+        ``write*()`` methods; already flushed rows can't be back-filled, so a
+        declaration that starts on or below a row already flushed is rejected.
+
+        The ``data`` option and calculated column ``formula`` options of
+        :func:`add_table` aren't supported.
+
+        Args:
+            first_row:    The first row of the cell range. (zero indexed).
+            first_col:    The first column of the cell range.
+            last_row:     The last row of the cell range. (zero indexed).
+            last_col:     The last column of the cell range.
+            options:      Table format options. (Optional)
+
+        Returns:
+            0:  Success.
+            -1: Row or column is out of worksheet bounds.
+            -2: Incorrect parameter or option.
+            -3: Not supported outside of constant_memory mode.
+        """
+        if not self.constant_memory:
+            warn(
+                "add_table_stream() is only supported in 'constant_memory' "
+                "mode"
+            )
+            return -3
+
+        return self._add_stream_table(
+            first_row, first_col, last_row, last_col, options
+        )
+
+    def _add_stream_table(
+        self,
+        first_row: int,
+        first_col: int,
+        last_row: int,
+        last_col: int,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Literal[0, -1, -2]:
+        # Pre-declare a table whose rows are going to be streamed. The range
+        # reservation and table metadata are only committed once all
+        # validation passes, so a failed declaration leaves no partial state.
+        if options is None:
+            options = {}
+        else:
+            # Copy the user defined options so they aren't modified.
+            options = options.copy()
+
+        # Check that row and col are valid without storing the values.
+        if self._check_dimensions(first_row, first_col, True, True):
+            return -1
+        if self._check_dimensions(last_row, last_col, True, True):
+            return -1
+
+        # Swap last row/col for first row/col as necessary.
+        if first_row > last_row:
+            first_row, last_row = (last_row, first_row)
+        if first_col > last_col:
+            first_col, last_col = (last_col, first_col)
+
+        # Valid input parameters. The one-shot "data" shortcut and calculated
+        # column formulas aren't supported in the streaming path.
+        valid_parameter = {
+            "autofilter",
+            "banded_columns",
+            "banded_rows",
+            "columns",
+            "first_column",
+            "header_row",
+            "last_column",
+            "name",
+            "style",
+            "total_row",
+            "description",
+            "title",
+        }
+
+        for param_key in options:
+            if param_key not in valid_parameter:
+                warn(f"Unknown parameter '{param_key}' in add_table()")
+                return -2
+
+        if "data" in options:
+            warn(
+                "Parameter 'data' isn't supported in add_table() in this mode"
+            )
+            return -2
+
+        # Turn on Excel's defaults.
+        options["banded_rows"] = options.get("banded_rows", True)
+        options["header_row"] = options.get("header_row", True)
+        options["autofilter"] = options.get("autofilter", True)
+
+        # Check that there are enough rows.
+        num_rows = last_row - first_row
+        if options["header_row"]:
+            num_rows -= 1
+
+        if num_rows < 0:
+            warn("Must have at least one data row in add_table()")
+            return -2
+
+        # Validate the table name without storing anything yet.
+        if "name" in options:
+            name = options["name"]
+
+            if " " in name:
+                warn(f"Name '{name}' in add_table() cannot contain spaces")
+                return -2
+
+            if _has_invalid_name_chars(name):
+                warn(f"Invalid Excel characters in add_table(): '{name}'")
+                return -2
+
+            if _utf16_len(name) > 255:
+                warn(
+                    f"Name '{name}' in add_table() exceeds Excel's limit of 255 "
+                    f"characters"
+                )
+                return -2
+
+            if re.match(r"^[a-zA-Z][a-zA-Z]?[a-dA-D]?\d+$", name):
+                warn(f"Name looks like a cell name in add_table(): '{name}'")
+                return -2
+
+            if re.match(r"^[rcRC]$", name) or re.match(r"^[rcRC]\d+[rcRC]\d+$", name):
+                warn(f"Invalid name '{name}' like a RC cell ref in add_table()")
+                return -2
+
+        # Check if the table range overlaps a previous merged or table range.
+        # The compact range list is only appended to once all checks pass, so
+        # a failed declaration leaves no partial range state.
+        cell_range = xl_range(first_row, first_col, last_row, last_col)
+        self._check_stream_table_overlap(
+            first_row, first_col, last_row, last_col, cell_range
+        )
+
+        # Excel requires unique case insensitive header names.
+        seen_names = set()
+        user_columns = options.get("columns", [])
+
+        for col_id in range(1, last_col - first_col + 2):
+            name = "Column" + str(col_id)
+
+            if col_id <= len(user_columns):
+                user_data = user_columns[col_id - 1]
+                if user_data and user_data.get("header"):
+                    name = user_data["header"]
+
+            name = name.lower()
+            if name in seen_names:
+                warn(f"Duplicate header name in add_table(): '{name}'")
+                return -2
+
+            seen_names.add(name)
+
+        # Calculated column formulas can't be generated while rows stream.
+        for user_data in user_columns:
+            if user_data and user_data.get("formula"):
+                warn(
+                    "Column 'formula' isn't supported in add_table() in "
+                    "'constant_memory' mode"
+                )
+                return -2
+
+        # Rows that have already been flushed can't be back-filled, so the
+        # table must start before the current (not yet flushed) row. This is
+        # checked after the structural validation so that overlaps, which are
+        # hard errors, take precedence.
+        if first_row < self.previous_row:
+            warn(
+                "add_table() in 'constant_memory' mode must be declared "
+                "before the rows it covers are written"
+            )
+            return -2
+
+        # All validation passed; commit the compact range reservation.
+        self.stream_table_ranges.append(
+            (first_row, first_col, last_row, last_col, cell_range)
+        )
+
+        # Build the table properties consumed by the Table XML writer.
+        table = {
+            "show_first_col": options.get("first_column", False),
+            "show_last_col": options.get("last_column", False),
+            "show_row_stripes": options.get("banded_rows", False),
+            "show_col_stripes": options.get("banded_columns", False),
+            "header_row_count": options.get("header_row", 0),
+            "totals_row_shown": options.get("total_row", False),
+            "description": options.get("description"),
+            "title": options.get("title"),
+        }
+
+        if "name" in options:
+            table["name"] = options["name"]
+
+        # Set the table style.
+        if "style" in options:
+            table["style"] = options["style"]
+
+            if table["style"] is None:
+                table["style"] = ""
+
+            table["style"] = table["style"].replace(" ", "")
+        else:
+            table["style"] = "TableStyleMedium9"
+
+        # Set the data range rows (without the header and footer).
+        first_data_row = first_row
+        last_data_row = last_row
+
+        if options.get("header_row"):
+            first_data_row += 1
+
+        if options.get("total_row"):
+            last_data_row -= 1
+
+        table["range"] = xl_range(first_row, first_col, last_row, last_col)
+        table["a_range"] = xl_range(first_row, first_col, last_data_row, last_col)
+
+        # If the header row is off the default is to turn autofilter off.
+        if not options["header_row"]:
+            options["autofilter"] = 0
+
+        if options["autofilter"]:
+            table["autofilter"] = table["a_range"]
+
+        # Build the table columns and pre-compute the totals row cells.
+        total_cells = {}
+        table["columns"] = []
+        col_id = 1
+
+        for col_num in range(first_col, last_col + 1):
+            col_data = {
+                "id": col_id,
+                "name": "Column" + str(col_id),
+                "total_string": "",
+                "total_function": "",
+                "custom_total": "",
+                "total_value": 0,
+                "formula": "",
+                "format": None,
+                "name_format": None,
+            }
+
+            xformat = None
+
+            if col_id <= len(user_columns):
+                user_data = user_columns[col_id - 1]
+            else:
+                user_data = None
+
+            if user_data:
+                xformat = user_data.get("format", None)
+
+                if user_data.get("header"):
+                    col_data["name"] = user_data["header"]
+
+                col_data["name_format"] = user_data.get("header_format")
+
+                if user_data.get("total_function"):
+                    function = user_data["total_function"]
+                    if function == "count_nums":
+                        function = "countNums"
+                    if function == "std_dev":
+                        function = "stdDev"
+
+                    subtotals = {
+                        "average",
+                        "countNums",
+                        "count",
+                        "max",
+                        "min",
+                        "stdDev",
+                        "sum",
+                        "var",
+                    }
+
+                    if function in subtotals:
+                        formula = self._table_function_to_formula(
+                            function, col_data["name"]
+                        )
+                    else:
+                        formula = self._prepare_formula(function, True)
+                        col_data["custom_total"] = formula
+                        function = "custom"
+
+                    col_data["total_function"] = function
+                    total_cells[col_num] = CellFormulaTuple(
+                        formula, xformat, user_data.get("total_value", 0)
+                    )
+
+                elif user_data.get("total_string"):
+                    total_string = user_data["total_string"]
+                    col_data["total_string"] = total_string
+                    total_cells[col_num] = CellStringTuple(
+                        total_string, user_data.get("format")
+                    )
+
+                if xformat is not None:
+                    col_data["format"] = xformat._get_dxf_index()
+
+            table["columns"].append(col_data)
+            col_id += 1
+
+        # Write the header row immediately (it is the first table row and
+        # therefore cannot have been flushed yet).
+        if options["header_row"]:
+            for col_id, col_num in enumerate(range(first_col, last_col + 1)):
+                col_data = table["columns"][col_id]
+                self._write_string(
+                    first_row, col_num, col_data["name"], col_data["name_format"]
+                )
+
+        # Register the table and remember where the totals row has to go.
+        self.tables.append(table)
+        self.stream_tables.append(
+            StreamTable(
+                first_row,
+                first_col,
+                last_row,
+                last_col,
+                table,
+                total_cells,
+            )
+        )
+
+        if options["autofilter"]:
+            for col in range(first_col, last_col + 1):
+                # Check that the table autofilter doesn't overlap a worksheet filter.
+                if self.filter_cells.get((first_row, col)):
+                    filter_type, filter_range = self.filter_cells.get((first_row, col))
+                    if filter_type == "worksheet":
+                        raise OverlappingRange(
+                            f"Table autofilter range '{cell_range}' overlaps previous "
+                            f"Worksheet autofilter range '{filter_range}'."
+                        )
+
+                self.filter_cells[(first_row, col)] = ("table", cell_range)
+
+        return 0
+
+    def _check_stream_table_overlap(
+        self,
+        first_row: int,
+        first_col: int,
+        last_row: int,
+        last_col: int,
+        cell_range: str,
+    ) -> None:
+        # Raise if the proposed table range overlaps an earlier streaming
+        # table range or any merged range. Checks are read-only so a failure
+        # never leaves partial state.
+        for other in self.stream_table_ranges:
+            if _rectangles_overlap(
+                first_row, first_col, last_row, last_col, other
+            ):
+                raise OverlappingRange(
+                    f"Table range '{cell_range}' overlaps previous "
+                    f"table range '{other[4]}'."
+                )
+
+        for row, col in self.merged_cells:
+            if first_row <= row <= last_row and first_col <= col <= last_col:
+                previous_range = self.merged_cells[(row, col)]
+                raise OverlappingRange(
+                    f"Table range '{cell_range}' overlaps previous "
+                    f"merge range '{previous_range}'."
+                )
+
+    def _write_stream_table_totals(self, row_num: int) -> None:
+        # Inject the pre-declared totals row cells into the row currently
+        # being assembled, before it is flushed in constant_memory mode.
+        remaining = []
+
+        for stream_table in self.stream_tables:
+            if stream_table.last_row == row_num:
+                for col_num, cell in stream_table.total_cells.items():
+                    self.table[row_num][col_num] = cell
+                    self._check_dimensions(row_num, col_num)
+            else:
+                remaining.append(stream_table)
+
+        self.stream_tables = remaining
 
     @convert_cell_args
     def add_sparkline(
@@ -6782,10 +7232,31 @@ class Worksheet(xmlwriter.XMLwriter):
         # one row of data is kept in memory at any one time. We don't
         # write span data in the optimized case since it is optional.
 
-        # Set the new previous row as the current row.
-        row_num = self.previous_row
+        flush_row = self.previous_row
+
+        # Stash the cells already assembled for the incoming row so the
+        # intermediate rows flushed below can't clear them.
+        incoming_cells = self.table.get(current_row_num)
+        if incoming_cells is not None:
+            incoming_cells = dict(incoming_cells)
+            del self.table[current_row_num]
+
+        # Flush every row up to the incoming one in strict order. Skipped
+        # pre-declared table totals rows are injected as they are reached so
+        # the emitted XML never contains out of order or missing rows.
+        while flush_row < current_row_num:
+            self._write_stream_table_totals(flush_row)
+            self._flush_single_row(flush_row)
+            flush_row += 1
+
         self.previous_row = current_row_num
 
+        # Restore the incoming row cells for a later write or flush.
+        if incoming_cells is not None:
+            self.table[current_row_num] = incoming_cells
+
+    def _flush_single_row(self, row_num: int) -> None:
+        # Write out the currently assembled row and reset the data table.
         if row_num in self.row_info or row_num in self.comments or self.table[row_num]:
             # Only process rows with formatting, cell data and/or comments.
 
@@ -6811,6 +7282,25 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Reset table.
         self.table.clear()
+
+    def _write_final_rows(self) -> None:
+        # Flush the last assembled row and any remaining pre-declared table
+        # totals rows when the workbook is packaged.
+        row_num = self.previous_row
+
+        # Inject the totals cells if the last assembled row is a totals row.
+        self._write_stream_table_totals(row_num)
+        self._flush_single_row(row_num)
+
+        # Emit totals rows that were never assembled by the caller.
+        totals_rows = sorted(
+            {stream_table.last_row for stream_table in self.stream_tables}
+        )
+        for totals_row in totals_rows:
+            self._write_stream_table_totals(totals_row)
+            self._flush_single_row(totals_row)
+
+        self.stream_tables = []
 
     def _calculate_spans(self) -> None:
         # Calculate the "spans" attribute of the <row> tag. This is an

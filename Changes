@@ -1,4 +1,13 @@
 
+Unreleased
+----------
+
+* Added :func:`add_table_stream()` to support Excel tables in
+  ``constant_memory`` mode. The table structure is pre-declared before the
+  data rows are written; :func:`add_table()` now routes to this path when
+  ``constant_memory`` is enabled. The one-shot ``data`` option and calculated
+  column ``formula`` option are not supported in this mode.
+
 Release 3.3.1 - October 28 2026
 -------------------------------
 

@@ -2010,7 +2010,7 @@ worksheet.add_table()
    :returns:  0: Success.
    :returns: -1: Row or column is out of worksheet bounds.
    :returns: -2: Incorrect parameter or option.
-   :returns: -3: Not supported in ``constant_memory`` mode.
+   :returns: -3: Not supported in the current memory mode.
 
 The ``add_table()`` method is used to group a range of cells into an Excel
 Table::
@@ -2029,10 +2029,56 @@ See :ref:`cell_notation` for more details.
 
 See also the examples in :ref:`ex_tables`.
 
-.. Note::
+In :func:`Workbook` ``'constant_memory'`` mode the call is routed to
+:func:`add_table_stream()`: the table must be declared before any of the rows
+it covers are written, and the ``data`` and calculated column ``formula``
+options aren't supported.
 
-   Tables aren't available in XlsxWriter when :func:`Workbook`
-   ``'constant_memory'`` mode is enabled.
+
+worksheet.add_table_stream()
+----------------------------
+
+.. py:function:: add_table_stream(first_row, first_col, last_row, last_col, options)
+
+   Pre-declare an Excel table in ``'constant_memory'`` mode.
+
+   :param first_row:   The first row of the range. (All zero indexed.)
+   :param first_col:   The first column of the range.
+   :param last_row:    The last row of the range.
+   :param last_col:    The last col of the range.
+   :param options:     Table formatting options. (Optional)
+   :type  first_row:   int
+   :type  first_col:   int
+   :type  last_row:    int
+   :type  last_col:    int
+   :type  options:     dict
+
+   :raises OverlappingRange: if the range overlaps a previous merge or table range.
+
+   :returns:  0: Success.
+   :returns: -1: Row or column is out of worksheet bounds.
+   :returns: -2: Incorrect parameter or option, or declared too late.
+   :returns: -3: Not supported outside of ``constant_memory`` mode.
+
+The ``add_table_stream()`` method pre-declares a table structure (name,
+column headers, style, autofilter, banded rows/columns, column formats and an
+optional totals row) before the data rows are written in
+``'constant_memory'`` mode. The caller then writes each data row with the
+standard ``write*()`` methods::
+
+    worksheet.add_table_stream('A1:D100',
+                               {'name': 'Sales', 'total_row': True,
+                                'columns': [{'header': 'Item'},
+                                            {'header': 'Qty',
+                                             'total_function': 'sum'}]})
+    worksheet.write_row(1, 0, ['Apples', 10])
+
+Rows that have already been flushed cannot be back-filled, so a declaration
+whose first row has already been written is rejected with a warning and
+``-2``. Overlapping table or :func:`merge_range()` ranges raise
+``OverlappingRange`` exactly as in :func:`add_table()`. The one-shot ``data``
+option and calculated column ``formula`` option are not supported in this
+mode.
 
 
 worksheet.add_sparkline()

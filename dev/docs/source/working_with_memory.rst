@@ -41,8 +41,12 @@ most spreadsheet applications.
 
 The trade-off when using ``'constant_memory'`` mode is that you won't be able
 to take advantage of any new features that manipulate cell data after it is
-written. Currently the :func:`add_table()` method doesn't work in this mode
-and :func:`merge_range()` and :func:`set_row()` only work for the current row.
+written. The :func:`merge_range()` and :func:`set_row()` methods only work for
+the current row, and a table must be pre-declared with
+:func:`add_table_stream()` (or :func:`add_table()`, which routes to it) before
+any of the rows it covers are written. The one-shot ``data`` option and
+calculated column ``formula`` option aren't supported in this mode; the data
+rows are written afterwards with the standard ``write*()`` methods.
 
 
 Performance Figures

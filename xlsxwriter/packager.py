@@ -195,7 +195,7 @@ class Packager:
 
             if worksheet.constant_memory:
                 worksheet._opt_reopen()
-                worksheet._write_single_row()
+                worksheet._write_final_rows()
 
             worksheet._set_xml_writer(
                 self._filename("xl/worksheets/sheet" + str(index) + ".xml")
