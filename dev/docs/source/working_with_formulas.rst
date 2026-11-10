@@ -89,6 +89,76 @@ to write to the appropriate cell::
     worksheet.write_number('A3', 14, cell_format)
 
 
+.. _formula_typed_results:
+
+Explicitly Typed Formula Results
+--------------------------------
+
+The ``value`` parameter described above infers the cached result type from
+the Python value. In most cases that is sufficient, but the inference has two
+limitations:
+
+- A string such as ``"001"`` that can be converted to a float is ambiguous,
+  and there is no way to force it to be stored as a string.
+- There is no way to supply a full matrix of typed cached values for every
+  cell of an array or dynamic array formula.
+
+For these cases XlsxWriter provides the
+:class:`xlsxwriter.formula_result.FormulaResult` class and the
+:func:`write_typed_formula`, :func:`write_typed_array_formula` and
+:func:`write_typed_dynamic_array_formula` worksheet methods. The result type
+is taken from the factory method used to create the object, never inferred
+from the value::
+
+    from xlsxwriter import FormulaResult
+
+    # The five supported cached result types.
+    worksheet.write_typed_formula('A1', '=1+2',        FormulaResult.number(3))
+    worksheet.write_typed_formula('A2', '=CODE("A")',  FormulaResult.string("001"))
+    worksheet.write_typed_formula('A3', '=TRUE()',     FormulaResult.boolean(True))
+    worksheet.write_typed_formula('A4', '=NA()',       FormulaResult.error("#N/A"))
+    worksheet.write_typed_formula('A5', '=1+1',        FormulaResult.blank())
+
+The factory methods validate their arguments, so ``FormulaResult.string``
+always writes a string cell (``t="str"``) even when the value is ``"001"``.
+The allowed error codes are the seven standard Excel codes: ``#NULL!``,
+``#DIV/0!``, ``#VALUE!``, ``#REF!``, ``#NAME?``, ``#NUM!`` and ``#N/A``.
+
+A *blank* result writes the formula element without a ``<v>`` element. This is
+different from :func:`FormulaResult.string` with an empty string, which writes
+an empty ``<v></v>`` element.
+
+For array and dynamic array formulas the result must be a matrix (a list of
+rows) with exactly the same shape as the formula range. The anchor cell keeps
+the formula and its own cached result, while every dependent cell in the
+range only contains its typed cached value::
+
+    worksheet.write_typed_array_formula(
+        'A1:B2',
+        '{=C1:D2}',
+        [
+            [FormulaResult.number(1), FormulaResult.string("001")],
+            [FormulaResult.boolean(True), FormulaResult.error("#DIV/0!")],
+        ],
+    )
+
+The matrix shape, overlapping ranges and cells that have already been written
+are checked before the worksheet is modified, and an
+:class:`xlsxwriter.exceptions.InvalidFormulaResult` or
+:class:`xlsxwriter.exceptions.FormulaRangeConflict` exception is raised on
+failure.
+
+Typed results are supported in both normal and ``constant_memory`` modes. In
+``constant_memory`` mode a range that starts in a row which has already been
+flushed cannot be written and raises
+:class:`xlsxwriter.exceptions.FormulaResultNotSupported`.
+
+As with the other formula methods, XlsxWriter does not calculate the formula;
+the supplied result is only the cached value stored in the file. Omitting a
+cached result (using the non-typed methods) keeps the historical default of
+storing 0.
+
+
 .. _formula_dynamic_arrays:
 
 Dynamic Array support

@@ -41,8 +41,22 @@ from xlsxwriter.chart import Chart
 from xlsxwriter.color import Color
 from xlsxwriter.comments import CommentType
 from xlsxwriter.drawing import Drawing, DrawingInfo, DrawingTypes
-from xlsxwriter.exceptions import DuplicateTableName, OverlappingRange
+from xlsxwriter.exceptions import (
+    DuplicateTableName,
+    FormulaRangeConflict,
+    FormulaResultNotSupported,
+    InvalidFormulaResult,
+    OverlappingRange,
+)
 from xlsxwriter.format import Format
+from xlsxwriter.formula_result import (
+    BLANK,
+    BOOLEAN,
+    ERROR,
+    NUMBER,
+    STRING,
+    FormulaResult,
+)
 from xlsxwriter.image import Image
 from xlsxwriter.shape import Shape
 from xlsxwriter.url import Url, UrlTypes
@@ -258,11 +272,16 @@ CellNumberTuple = namedtuple("Number", "number, format")
 CellStringTuple = namedtuple("String", "string, format")
 CellBooleanTuple = namedtuple("Boolean", "boolean, format")
 CellFormulaTuple = namedtuple("Formula", "formula, format, value")
+CellTypedFormulaTuple = namedtuple("TypedFormula", "formula, format, result")
 CellDatetimeTuple = namedtuple("Datetime", "number, format")
 CellRichStringTuple = namedtuple("RichString", "string, format, raw_string")
 CellArrayFormulaTuple = namedtuple(
     "ArrayFormula", "formula, format, value, range, atype"
 )
+CellTypedArrayFormulaTuple = namedtuple(
+    "TypedArrayFormula", "formula, format, result, range, atype"
+)
+CellFormulaResultTuple = namedtuple("FormulaResultCell", "result, format")
 
 ###############################################################################
 #
@@ -479,6 +498,12 @@ class Worksheet(xmlwriter.XMLwriter):
 
         self.rstring = ""
         self.previous_row = 0
+
+        # In constant_memory mode, typed array formulas whose dependent rows
+        # haven't been flushed yet. The ranges list drives overlap checks and
+        # the dict maps each pending row to its cached dependent cells.
+        self.typed_array_ranges = []
+        self.pending_typed_rows = {}
 
         self.validations = []
         self.cond_formats = {}
@@ -714,8 +739,7 @@ class Worksheet(xmlwriter.XMLwriter):
             string_index = string
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellStringTuple(string_index, cell_format)
@@ -778,8 +802,7 @@ class Worksheet(xmlwriter.XMLwriter):
             return -1
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellNumberTuple(number, cell_format)
@@ -820,8 +843,7 @@ class Worksheet(xmlwriter.XMLwriter):
             return -1
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellBlankTuple(cell_format)
@@ -888,8 +910,7 @@ class Worksheet(xmlwriter.XMLwriter):
         formula = self._prepare_formula(formula)
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellFormulaTuple(formula, cell_format, value)
@@ -984,6 +1005,455 @@ class Worksheet(xmlwriter.XMLwriter):
             self.has_dynamic_arrays = True
 
         return error
+
+    @convert_cell_args
+    def write_typed_formula(
+        self,
+        row: int,
+        col: int,
+        formula: str,
+        result: FormulaResult,
+        cell_format: Optional[Format] = None,
+    ) -> Literal[0, -1]:
+        """
+        Write a formula with an explicitly typed cached result.
+
+        Unlike :func:`write_formula`, the cached result type is taken from
+        the supplied :class:`FormulaResult` rather than inferred from the
+        Python value. XlsxWriter doesn't calculate the formula; the supplied
+        result is written verbatim as the cached cell value.
+
+        Args:
+            row:         The cell row (zero indexed).
+            col:         The cell column (zero indexed).
+            formula:     Cell formula.
+            result:      A :class:`FormulaResult` cached value.
+            cell_format: An optional cell Format object.
+
+        Returns:
+            0:  Success.
+            -1: Row or column is out of worksheet bounds.
+
+        """
+        return self._write_typed_formula(row, col, formula, result, cell_format)
+
+    # Undecorated version of write_typed_formula().
+    def _write_typed_formula(
+        self, row, col, formula, result, cell_format=None
+    ) -> Literal[0, -1]:
+        # In constant_memory mode reject cells in rows that have already
+        # been flushed, before any dimension or table state is updated.
+        if self.constant_memory and row < self.previous_row:
+            self._check_range_writable(row, col, row, col)
+
+        # Check that row and col are valid and store max and min values.
+        if self._check_dimensions(row, col):
+            return -1
+
+        if formula is None or formula == "":
+            warn("Formula can't be None or empty")
+            return -1
+
+        # Validate the cached result before modifying any cell data.
+        result = self._check_typed_result(result)
+
+        # Check for dynamic array functions.
+        if re_dynamic_function.search(formula):
+            return self._write_typed_array_formula(
+                row, col, row, col, formula, [[result]], cell_format, "dynamic"
+            )
+
+        # Hand off array formulas.
+        if formula.startswith("{") and formula.endswith("}"):
+            return self._write_typed_array_formula(
+                row, col, row, col, formula, [[result]], cell_format, "static"
+            )
+
+        # Check for overlap/conflict errors before modifying the sheet.
+        self._check_range_writable(row, col, row, col)
+
+        # Modify the formula string, as needed.
+        formula = self._prepare_formula(formula)
+
+        # Write previous row if in in-line string constant_memory mode.
+        if self.constant_memory and row > self.previous_row:
+            self._write_single_row(row)
+
+        # Store the cell data in the worksheet data table.
+        self.table[row][col] = CellTypedFormulaTuple(
+            formula, cell_format, result
+        )
+
+        return 0
+
+    @convert_range_args
+    def write_typed_array_formula(
+        self,
+        first_row: int,
+        first_col: int,
+        last_row: int,
+        last_col: int,
+        formula: str,
+        result_matrix: List[List[FormulaResult]],
+        cell_format: Optional[Format] = None,
+    ) -> Literal[0, -1]:
+        """
+        Write an array formula with a matrix of explicitly typed cached
+        results.
+
+        The ``result_matrix`` must be a list of rows, each containing
+        :class:`FormulaResult` objects, with exactly the same shape as the
+        formula range. The anchor cell keeps the formula and its own cached
+        result; the dependent cells in the range only contain their
+        respective cached results.
+
+        Args:
+            first_row:      The first row of the cell range (zero indexed).
+            first_col:      The first column of the cell range.
+            last_row:       The last row of the cell range (zero indexed).
+            last_col:       The last column of the cell range.
+            formula:        Cell formula.
+            result_matrix:  A matrix of :class:`FormulaResult` cached values
+                            with the same shape as the range.
+            cell_format:    An optional cell Format object.
+
+        Returns:
+            0:  Success.
+            -1: Row or column is out of worksheet bounds.
+
+        """
+        return self._write_typed_array_formula(
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            formula,
+            result_matrix,
+            cell_format,
+            "static",
+        )
+
+    @convert_range_args
+    def write_typed_dynamic_array_formula(
+        self,
+        first_row: int,
+        first_col: int,
+        last_row: int,
+        last_col: int,
+        formula: str,
+        result_matrix: List[List[FormulaResult]],
+        cell_format: Optional[Format] = None,
+    ) -> Literal[0, -1]:
+        """
+        Write a dynamic array formula with a matrix of explicitly typed
+        cached results.
+
+        The semantics match :func:`write_typed_array_formula` but the
+        formula is marked as a dynamic (spilled) array formula.
+
+        Args:
+            first_row:      The first row of the cell range (zero indexed).
+            first_col:      The first column of the cell range.
+            last_row:       The last row of the cell range (zero indexed).
+            last_col:       The last column of the cell range.
+            formula:        Cell formula.
+            result_matrix:  A matrix of :class:`FormulaResult` cached values
+                            with the same shape as the range.
+            cell_format:    An optional cell Format object.
+
+        Returns:
+            0:  Success.
+            -1: Row or column is out of worksheet bounds.
+
+        """
+        error = self._write_typed_array_formula(
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            formula,
+            result_matrix,
+            cell_format,
+            "dynamic",
+        )
+
+        if error == 0:
+            self.has_dynamic_arrays = True
+
+        return error
+
+    # Undecorated version of write_typed_array_formula() and
+    # write_typed_dynamic_array_formula().
+    def _write_typed_array_formula(
+        self,
+        first_row,
+        first_col,
+        last_row,
+        last_col,
+        formula,
+        result_matrix,
+        cell_format=None,
+        atype="static",
+    ) -> Literal[0, -1]:
+        # In constant_memory mode reject ranges starting in a row that has
+        # already been flushed, before any dimension state is updated.
+        if self.constant_memory and first_row < self.previous_row:
+            self._check_range_writable(
+                first_row, first_col, last_row, last_col
+            )
+
+        # Swap last row/col with first row/col as necessary.
+        if first_row > last_row:
+            first_row, last_row = last_row, first_row
+        if first_col > last_col:
+            first_col, last_col = last_col, first_col
+
+        # Check that row and col are valid and store max and min values.
+        if self._check_dimensions(first_row, first_col):
+            return -1
+        if self._check_dimensions(last_row, last_col):
+            return -1
+
+        if formula is None or formula == "":
+            warn("Formula can't be None or empty")
+            return -1
+
+        n_rows = last_row - first_row + 1
+        n_cols = last_col - first_col + 1
+
+        # Validate the result matrix shape and contents before any writes.
+        result_matrix = self._check_typed_matrix(
+            result_matrix, n_rows, n_cols
+        )
+
+        # Check for overlap/conflict errors before modifying the sheet.
+        self._check_range_writable(first_row, first_col, last_row, last_col)
+
+        # Define array range.
+        if first_row == last_row and first_col == last_col:
+            cell_range = xl_rowcol_to_cell(first_row, first_col)
+        else:
+            cell_range = (
+                xl_rowcol_to_cell(first_row, first_col)
+                + ":"
+                + xl_rowcol_to_cell(last_row, last_col)
+            )
+
+        # Modify the formula string, as needed.
+        formula = self._prepare_formula(formula)
+
+        # Write previous row if in in-line string constant_memory mode.
+        if self.constant_memory and first_row > self.previous_row:
+            self._write_single_row(first_row)
+
+        if self.constant_memory:
+            # The anchor and any dependent cells on the anchor row can be
+            # stored now; later rows are applied when they are flushed.
+            self.table[first_row][first_col] = CellTypedArrayFormulaTuple(
+                formula, cell_format, result_matrix, cell_range, atype
+            )
+
+            for col in range(first_col + 1, last_col + 1):
+                result = result_matrix[0][col - first_col]
+                if result.type != BLANK:
+                    self.table[first_row][col] = CellFormulaResultTuple(
+                        result, cell_format
+                    )
+
+            if last_row > first_row:
+                self.typed_array_ranges.append(
+                    (first_row, first_col, last_row, last_col)
+                )
+
+                # Index the dependent cells by row so they can be injected in
+                # order when each row is flushed, even if writes skip rows.
+                for row in range(first_row + 1, last_row + 1):
+                    row_cells = {}
+                    matrix_row = row - first_row
+                    for col in range(first_col, last_col + 1):
+                        result = result_matrix[matrix_row][col - first_col]
+                        if result.type != BLANK:
+                            row_cells[col] = CellFormulaResultTuple(
+                                result, cell_format
+                            )
+                    # Rows made entirely of blank results produce no cell
+                    # data, so they don't get a <row> element (matching the
+                    # non-constant_memory behavior).
+                    if row_cells:
+                        self.pending_typed_rows.setdefault(row, []).append(
+                            row_cells
+                        )
+        else:
+            # Store the anchor cell in the worksheet data table.
+            self.table[first_row][first_col] = CellTypedArrayFormulaTuple(
+                formula, cell_format, result_matrix, cell_range, atype
+            )
+
+            # Store the cached results for the dependent cells.
+            for row in range(first_row, last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if row == first_row and col == first_col:
+                        continue
+
+                    result = result_matrix[row - first_row][col - first_col]
+                    if result.type != BLANK:
+                        self.table[row][col] = CellFormulaResultTuple(
+                            result, cell_format
+                        )
+
+        return 0
+
+    # Validate a single explicitly typed formula result.
+    def _check_typed_result(self, result) -> FormulaResult:
+        if not isinstance(result, FormulaResult):
+            raise InvalidFormulaResult(
+                "Typed formula results must be FormulaResult objects, got "
+                f"{type(result).__name__}"
+            )
+
+        return result
+
+    # Validate the shape and contents of a typed cached result matrix.
+    def _check_typed_matrix(self, result_matrix, n_rows, n_cols):
+        if (
+            not isinstance(result_matrix, list)
+            or not result_matrix
+            or not all(isinstance(matrix_row, list) for matrix_row in result_matrix)
+        ):
+            raise InvalidFormulaResult(
+                "Typed array formula results must be a non-empty list of "
+                "lists of FormulaResult objects"
+            )
+
+        if len(result_matrix) != n_rows:
+            raise InvalidFormulaResult(
+                f"Result matrix has {len(result_matrix)} rows but the "
+                f"formula range has {n_rows} rows"
+            )
+
+        for row_index, matrix_row in enumerate(result_matrix):
+            if len(matrix_row) != n_cols:
+                raise InvalidFormulaResult(
+                    f"Result matrix row {row_index} has {len(matrix_row)} "
+                    f"values but the formula range has {n_cols} columns"
+                )
+
+            for result in matrix_row:
+                self._check_typed_result(result)
+
+        return result_matrix
+
+    # Check that a cell range doesn't overlap a pending array or a cell that
+    # has already been written. All validation happens before the sheet data
+    # is modified.
+    def _check_range_writable(
+        self, first_row, first_col, last_row, last_col
+    ) -> None:
+        if self.constant_memory:
+            if first_row < self.previous_row:
+                raise FormulaResultNotSupported(
+                    f"Can't write a typed formula result to row {first_row} "
+                    f"in constant_memory mode; row {self.previous_row} has "
+                    "already been flushed"
+                )
+
+            # Check against typed array ranges that are still pending.
+            for (
+                pending_first_row,
+                pending_first_col,
+                pending_last_row,
+                pending_last_col,
+            ) in self.typed_array_ranges:
+                if (
+                    first_row <= pending_last_row
+                    and last_row >= pending_first_row
+                    and first_col <= pending_last_col
+                    and last_col >= pending_first_col
+                ):
+                    raise FormulaRangeConflict(
+                        "Typed formula range overlaps a previously written "
+                        "typed array formula range"
+                    )
+
+            # Only the current (not yet flushed) row is still held in memory;
+            # rows below previous_row have already been serialized.
+            for row in range(max(first_row, self.previous_row), last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if col in self.table.get(row, {}):
+                        raise FormulaRangeConflict(
+                            f"Cell {xl_rowcol_to_cell(row, col)} has already "
+                            "been written"
+                        )
+        else:
+            for row in range(first_row, last_row + 1):
+                for col in range(first_col, last_col + 1):
+                    if col in self.table[row]:
+                        raise FormulaRangeConflict(
+                            f"Cell {xl_rowcol_to_cell(row, col)} has already "
+                            "been written"
+                        )
+
+    # Check that a single cell write doesn't collide with a typed array range
+    # that is still pending in constant_memory mode.
+    def _check_cell_writable(self, row, col) -> None:
+        if not self.constant_memory:
+            return
+
+        # After the preceding flush, row <= previous_row is either already
+        # serialized or is the active row being written now. The active row's
+        # own pending cells are merged when it is later flushed, so only
+        # strictly later rows can conflict with a write at this point.
+        if row <= self.previous_row:
+            return
+
+        # Only rows still indexed here are unflushed. Flushed rows are popped
+        # from the mapping during serialization.
+        for row_cells in self.pending_typed_rows.get(row, []):
+            if col in row_cells:
+                raise FormulaRangeConflict(
+                    f"Cell {xl_rowcol_to_cell(row, col)} belongs to a typed "
+                    "array formula range"
+                )
+
+    # In constant_memory mode flush any completed row before writing a new
+    # cell, then verify the target cell doesn't collide with a still-pending
+    # typed array cell. The flush happens first so a row being transitioned
+    # out of the active row isn't mistaken for a future conflict.
+    def _prepare_constant_memory_row(self, row, col) -> None:
+        if not self.constant_memory:
+            return
+
+        if row > self.previous_row:
+            self._write_single_row(row)
+
+        self._check_cell_writable(row, col)
+
+    # Inject cached results from pending typed array formulas into the row
+    # that is about to be flushed in constant_memory mode.
+    def _inject_pending_typed_row(self, row_num) -> None:
+        row_entries = self.pending_typed_rows.get(row_num)
+        if row_entries is None:
+            return
+
+        # Remove the pending entry first so a conflict can't leave stale
+        # state behind.
+        del self.pending_typed_rows[row_num]
+
+        for row_cells in row_entries:
+            for col, cell in row_cells.items():
+                # A user write to this cell takes precedence, matching the
+                # non-constant_memory behavior where a later write overwrites
+                # an earlier array dependent cell.
+                if col in self.table[row_num]:
+                    continue
+                self.table[row_num][col] = cell
+
+        # Drop ranges that have been fully flushed.
+        self.typed_array_ranges = [
+            range_tuple
+            for range_tuple in self.typed_array_ranges
+            if range_tuple[2] > row_num
+        ]
 
     # Utility method to strip equal sign and array braces from a formula and
     # also expand out future and dynamic array formulas.
@@ -1237,6 +1707,10 @@ class Worksheet(xmlwriter.XMLwriter):
         formula = self._prepare_formula(formula)
 
         # Write previous row if in in-line string constant_memory mode.
+        if self.constant_memory:
+            self._check_range_writable(
+                first_row, first_col, last_row, last_col
+            )
         if self.constant_memory and first_row > self.previous_row:
             self._write_single_row(first_row)
 
@@ -1285,8 +1759,7 @@ class Worksheet(xmlwriter.XMLwriter):
             return -1
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         # Convert datetime to an Excel date.
         number = self._convert_date_time(date)
@@ -1327,8 +1800,7 @@ class Worksheet(xmlwriter.XMLwriter):
             return -1
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         if boolean:
             value = 1
@@ -1428,8 +1900,7 @@ class Worksheet(xmlwriter.XMLwriter):
 
         if not self.ignore_write_string:
             # Write previous row if in in-line string constant_memory mode.
-            if self.constant_memory and row > self.previous_row:
-                self._write_single_row(row)
+            self._prepare_constant_memory_row(row, col)
 
             # Write the hyperlink string.
             self._write_string(row, col, url.text, cell_format)
@@ -1572,8 +2043,7 @@ class Worksheet(xmlwriter.XMLwriter):
             string_index = string
 
         # Write previous row if in in-line string constant_memory mode.
-        if self.constant_memory and row > self.previous_row:
-            self._write_single_row(row)
+        self._prepare_constant_memory_row(row, col)
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellRichStringTuple(
@@ -6786,31 +7256,134 @@ class Worksheet(xmlwriter.XMLwriter):
         row_num = self.previous_row
         self.previous_row = current_row_num
 
-        if row_num in self.row_info or row_num in self.comments or self.table[row_num]:
-            # Only process rows with formatting, cell data and/or comments.
-
-            # No span data in optimized mode.
-            span = None
-
-            if self.table[row_num]:
-                # Write the cells if the row contains data.
-                if row_num not in self.row_info:
-                    self._write_row(row_num, span)
-                else:
-                    self._write_row(row_num, span, self.row_info[row_num])
-
-                for col_num in range(self.dim_colmin, self.dim_colmax + 1):
-                    if col_num in self.table[row_num]:
-                        col_ref = self.table[row_num][col_num]
-                        self._write_cell(row_num, col_num, col_ref)
-
-                self._xml_end_tag("row")
+        if self.constant_memory:
+            if current_row_num == 0:
+                # Final flush at close time. Pending typed array rows and the
+                # last user row are emitted in strictly increasing order.
+                self._flush_final_typed_rows(row_num)
+                return
             else:
-                # Row attributes or comments only.
-                self._write_empty_row(row_num, span, self.row_info[row_num])
+                # Emit pending rows strictly below the row being flushed. The
+                # row at row_num itself is the active row and is handled by
+                # _inject_pending_typed_row() below.
+                self._flush_pending_typed_rows_below(row_num)
+                self._inject_pending_typed_row(row_num)
+
+        if (
+            row_num in self.row_info
+            or row_num in self.comments
+            or self.table[row_num]
+        ):
+            self._serialize_row_cells(row_num)
 
         # Reset table.
         self.table.clear()
+
+    # Serialize the <row> element for the cells currently stored in the table
+    # for the given row.
+    def _serialize_row_cells(self, row_num) -> None:
+        span = None
+
+        if self.table[row_num]:
+            # Write the cells if the row contains data.
+            if row_num not in self.row_info:
+                self._write_row(row_num, span)
+            else:
+                self._write_row(row_num, span, self.row_info[row_num])
+
+            for col_num in range(self.dim_colmin, self.dim_colmax + 1):
+                if col_num in self.table[row_num]:
+                    cell = self.table[row_num][col_num]
+                    self._write_cell(row_num, col_num, cell)
+
+            self._xml_end_tag("row")
+        else:
+            # Row attributes or comments only.
+            self._write_empty_row(row_num, span, self.row_info[row_num])
+
+    # Final constant_memory flush: interleave pending typed array rows with
+    # the last user row so the serialized <row> elements stay ordered.
+    def _flush_final_typed_rows(self, final_row) -> None:
+        # Preserve the cells of the final user row; pending serialization
+        # clears the shared table after each row.
+        final_user_cells = dict(self.table.get(final_row, {}))
+        # Detach the final user row from the shared table so serializing
+        # intermediate pending rows (which clears the table) can't destroy
+        # it. It is re-attached when its own turn arrives.
+        self.table.pop(final_row, None)
+        has_final_row = bool(
+            final_user_cells
+            or final_row in self.row_info
+            or final_row in self.comments
+        )
+
+        # Merge the final user row with pending typed array rows in strictly
+        # increasing row order.
+        while self.pending_typed_rows or has_final_row:
+            next_pending = (
+                min(self.pending_typed_rows)
+                if self.pending_typed_rows
+                else None
+            )
+
+            if has_final_row and (
+                next_pending is None or final_row <= next_pending
+            ):
+                if next_pending == final_row:
+                    # Same index: merge pending cells into the user row.
+                    self.table[final_row].update(final_user_cells)
+                    self._inject_pending_typed_row(final_row)
+                else:
+                    self.table[final_row].update(final_user_cells)
+
+                self._serialize_row_cells(final_row)
+                self.table.clear()
+                has_final_row = False
+            else:
+                self._serialize_pending_typed_row(next_pending)
+
+    # Emit pending typed array rows strictly below stop_row. Rows are keyed
+    # by row number, so this works even when user writes skip over rows
+    # covered by an array formula.
+    def _flush_pending_typed_rows_below(self, stop_row) -> None:
+        while self.pending_typed_rows:
+            next_row = min(self.pending_typed_rows)
+            if next_row >= stop_row:
+                return
+            self._serialize_pending_typed_row(next_row)
+
+    # Inject, serialize and reset a single pending typed array row.
+    def _serialize_pending_typed_row(self, row_num) -> None:
+        # Serialize a pending row without disturbing unrelated rows that the
+        # shared table may still hold (e.g. a later active user row).
+        row_entries = self.pending_typed_rows.pop(row_num, None)
+        if row_entries is None:
+            return
+
+        # Merge with any user-written cells already stored for this row;
+        # user-written cells take precedence, matching normal mode.
+        row_cells = dict(self.table.get(row_num, {}))
+        for entry in row_entries:
+            for col, cell in entry.items():
+                if col in row_cells:
+                    continue
+                row_cells[col] = cell
+
+        # Drop ranges that have been fully flushed.
+        self.typed_array_ranges = [
+            range_tuple
+            for range_tuple in self.typed_array_ranges
+            if range_tuple[2] > row_num
+        ]
+
+        self.table[row_num] = row_cells
+        try:
+            self._serialize_row_cells(row_num)
+        finally:
+            if row_cells:
+                del self.table[row_num]
+            else:
+                self.table.pop(row_num, None)
 
     def _calculate_spans(self) -> None:
         # Calculate the "spans" attribute of the <row> tag. This is an
@@ -7030,6 +7603,29 @@ class Worksheet(xmlwriter.XMLwriter):
             self._write_cell_value(cell.value)
             self._xml_end_tag("c")
 
+        elif type_cell_name == "TypedFormula":
+            # Write a formula with an explicitly typed cached result.
+            self._write_typed_formula_cell(
+                cell.formula, cell.result, attributes
+            )
+
+        elif type_cell_name == "TypedArrayFormula":
+            # Write an array formula with an explicitly typed anchor result.
+            if cell.atype == "dynamic":
+                attributes.append(("cm", 1))
+
+            anchor_result = cell.result[0][0]
+            self._append_result_type_attribute(anchor_result, attributes)
+
+            self._xml_start_tag("c", attributes)
+            self._write_cell_array_formula(cell.formula, cell.range)
+            self._write_typed_result_value(anchor_result)
+            self._xml_end_tag("c")
+
+        elif type_cell_name == "FormulaResultCell":
+            # Write the cached result of a dependent array formula cell.
+            self._write_typed_result_cell(cell.result, attributes)
+
         elif type_cell_name == "Blank":
             # Write a empty cell.
             self._xml_empty_tag("c", attributes)
@@ -7055,6 +7651,51 @@ class Worksheet(xmlwriter.XMLwriter):
             value = ""
 
         self._xml_data_element("v", value)
+
+    # Add the c/@t attribute required by an explicitly typed result.
+    def _append_result_type_attribute(self, result, attributes) -> None:
+        if result.type == STRING:
+            attributes.append(("t", "str"))
+        elif result.type == BOOLEAN:
+            attributes.append(("t", "b"))
+        elif result.type == ERROR:
+            attributes.append(("t", "e"))
+        # number and blank cells don't use a t attribute.
+
+    # Write the <v> element for an explicitly typed result. Blank results
+    # have no <v> element at all.
+    def _write_typed_result_value(self, result) -> None:
+        if result.type == BLANK:
+            return
+
+        if result.type == BOOLEAN:
+            value = 1 if result.value else 0
+        elif result.type == NUMBER and result.value.__class__ is Fraction:
+            value = float(result.value)
+        else:
+            value = result.value
+
+        self._write_cell_value(value)
+
+    # Write a formula cell with an explicitly typed cached result.
+    def _write_typed_formula_cell(self, formula, result, attributes) -> None:
+        self._append_result_type_attribute(result, attributes)
+
+        self._xml_start_tag("c", attributes)
+        self._xml_data_element("f", formula)
+        self._write_typed_result_value(result)
+        self._xml_end_tag("c")
+
+    # Write a dependent array formula cell holding only a cached result.
+    def _write_typed_result_cell(self, result, attributes) -> None:
+        self._append_result_type_attribute(result, attributes)
+
+        if result.type == BLANK:
+            self._xml_empty_tag("c", attributes)
+        else:
+            self._xml_start_tag("c", attributes)
+            self._write_typed_result_value(result)
+            self._xml_end_tag("c")
 
     def _write_cell_array_formula(self, formula, cell_range) -> None:
         # Write the cell array formula <f> element.

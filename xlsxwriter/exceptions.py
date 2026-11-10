@@ -40,6 +40,18 @@ class OverlappingRange(XlsxInputError):
     """Worksheet merge range or table overlaps previous range."""
 
 
+class InvalidFormulaResult(XlsxInputError):
+    """Typed formula result is invalid or has the wrong matrix shape."""
+
+
+class FormulaRangeConflict(XlsxInputError):
+    """Formula range overlaps another range or an already written cell."""
+
+
+class FormulaResultNotSupported(XlsxInputError):
+    """Typed formula result cannot be written in the current write mode."""
+
+
 class UndefinedImageSize(XlsxFileError):
     """No size data found in image file."""
 

@@ -6,5 +6,6 @@
 __version__ = "3.3.1"
 __VERSION__ = __version__
 from xlsxwriter.workbook import Workbook
+from xlsxwriter.formula_result import FormulaResult
 
-__all__ = ["Workbook"]
+__all__ = ["Workbook", "FormulaResult"]
