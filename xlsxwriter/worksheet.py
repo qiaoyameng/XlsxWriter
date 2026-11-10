@@ -501,6 +501,7 @@ class Worksheet(xmlwriter.XMLwriter):
         self.default_url_format = None
         self.default_checkbox_format = None
         self.workbook_add_format = None
+        self.workbook_snapshot_format = None
         self.remove_timezone = False
         self.max_url_length = 2079
 
@@ -691,6 +692,15 @@ class Worksheet(xmlwriter.XMLwriter):
         """
         return self._write_string(row, col, string, cell_format)
 
+    def _snapshot_format(self, cell_format: Optional[Format]) -> Optional[Format]:
+        # In 'format_snapshot' mode replace the format with a snapshot of
+        # its current properties, taken at the point it is assigned to a
+        # cell, row or column. Otherwise return the format unchanged.
+        if cell_format is None or self.workbook_snapshot_format is None:
+            return cell_format
+
+        return self.workbook_snapshot_format(cell_format)
+
     # Undecorated version of write_string().
     def _write_string(
         self, row: int, col: int, string: str, cell_format: Optional[Format] = None
@@ -700,6 +710,8 @@ class Worksheet(xmlwriter.XMLwriter):
         # Check that row and col are valid and store max and min values.
         if self._check_dimensions(row, col):
             return -1
+
+        cell_format = self._snapshot_format(cell_format)
 
         # Check that the string is < 32767 UTF-16 units. A string can't exceed
         # the limit if it is less than half of it, so skip the slower check.
@@ -777,6 +789,8 @@ class Worksheet(xmlwriter.XMLwriter):
         if self._check_dimensions(row, col):
             return -1
 
+        cell_format = self._snapshot_format(cell_format)
+
         # Write previous row if in in-line string constant_memory mode.
         if self.constant_memory and row > self.previous_row:
             self._write_single_row(row)
@@ -818,6 +832,8 @@ class Worksheet(xmlwriter.XMLwriter):
         # Check that row and col are valid and store max and min values.
         if self._check_dimensions(row, col):
             return -1
+
+        cell_format = self._snapshot_format(cell_format)
 
         # Write previous row if in in-line string constant_memory mode.
         if self.constant_memory and row > self.previous_row:
@@ -871,6 +887,8 @@ class Worksheet(xmlwriter.XMLwriter):
         if formula is None or formula == "":
             warn("Formula can't be None or empty")
             return -1
+
+        cell_format = self._snapshot_format(cell_format)
 
         # Check for dynamic array functions.
         if re_dynamic_function.search(formula):
@@ -1223,6 +1241,8 @@ class Worksheet(xmlwriter.XMLwriter):
         if self._check_dimensions(last_row, last_col):
             return -1
 
+        cell_format = self._snapshot_format(cell_format)
+
         # Define array range
         if first_row == last_row and first_col == last_col:
             cell_range = xl_rowcol_to_cell(first_row, first_col)
@@ -1295,6 +1315,8 @@ class Worksheet(xmlwriter.XMLwriter):
         if cell_format is None:
             cell_format = self.default_date_format
 
+        cell_format = self._snapshot_format(cell_format)
+
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellDatetimeTuple(number, cell_format)
 
@@ -1334,6 +1356,8 @@ class Worksheet(xmlwriter.XMLwriter):
             value = 1
         else:
             value = 0
+
+        cell_format = self._snapshot_format(cell_format)
 
         # Store the cell data in the worksheet data table.
         self.table[row][col] = CellBooleanTuple(value, cell_format)
@@ -1478,6 +1502,7 @@ class Worksheet(xmlwriter.XMLwriter):
         # If the last arg is a format we use it as the cell format.
         if isinstance(tokens[-1], Format):
             cell_format = tokens.pop()
+            cell_format = self._snapshot_format(cell_format)
 
         # Create a temp XMLWriter object and use it to write the rich string
         # XML to a string.
@@ -2149,6 +2174,8 @@ class Worksheet(xmlwriter.XMLwriter):
 
         self.outline_col_level = max(self.outline_col_level, level)
 
+        cell_format = self._snapshot_format(cell_format)
+
         # Store the column data.
         for col in range(first_col, last_col + 1):
             self.col_info[col] = ColumnInfo(
@@ -2398,6 +2425,8 @@ class Worksheet(xmlwriter.XMLwriter):
         level = min(level, 7)
 
         self.outline_row_level = max(self.outline_row_level, level)
+
+        cell_format = self._snapshot_format(cell_format)
 
         # Store the row properties.
         self.row_info[row] = RowInfo(
@@ -3206,7 +3235,8 @@ class Worksheet(xmlwriter.XMLwriter):
 
         # Get the dxf format index.
         if options.get("format"):
-            options["format"] = options["format"]._get_dxf_index()
+            dxf_format = self._snapshot_format(options["format"])
+            options["format"] = dxf_format._get_dxf_index()
 
         # Set the priority based on the order of adding.
         options["priority"] = self.dxf_priority
@@ -5000,6 +5030,7 @@ class Worksheet(xmlwriter.XMLwriter):
         self.default_date_format = init_data["default_date_format"]
         self.default_url_format = init_data["default_url_format"]
         self.workbook_add_format = init_data["workbook_add_format"]
+        self.workbook_snapshot_format = init_data["workbook_snapshot_format"]
         self.excel2003_style = init_data["excel2003_style"]
         self.remove_timezone = init_data["remove_timezone"]
         self.max_url_length = init_data["max_url_length"]

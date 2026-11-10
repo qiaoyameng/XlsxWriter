@@ -96,6 +96,7 @@ class Workbook(xmlwriter.XMLwriter):
         self.use_future_functions = options.get("use_future_functions", False)
         self.default_row_height = options.get("default_row_height", 20)
         self.default_col_width = options.get("default_column_width", 64)
+        self.format_snapshot = options.get("format_snapshot", False)
         self.default_format_properties = options.get(
             "default_format_properties", {"font_name": "Calibri", "font_size": 11}
         )
@@ -122,6 +123,7 @@ class Workbook(xmlwriter.XMLwriter):
         self.drawings = []
         self.sheetnames = {}
         self.formats = []
+        self.format_snapshots = {}
         self.xf_formats = []
         self.xf_format_indices = {}
         self.dxf_formats = []
@@ -962,6 +964,9 @@ class Workbook(xmlwriter.XMLwriter):
             "default_date_format": self.default_date_format,
             "default_url_format": self.default_url_format,
             "workbook_add_format": self.add_format,
+            "workbook_snapshot_format": (
+                self._snapshot_format if self.format_snapshot else None
+            ),
             "excel2003_style": self.excel2003_style,
             "remove_timezone": self.remove_timezone,
             "max_url_length": self.max_url_length,
@@ -1044,6 +1049,30 @@ class Workbook(xmlwriter.XMLwriter):
 
         # Set the fill index for the format objects.
         self._prepare_fills()
+
+    def _snapshot_format(self, cell_format: Optional[Format]) -> Optional[Format]:
+        # In 'format_snapshot' mode, replace a user defined format with an
+        # internal snapshot of its current properties, so that subsequent
+        # changes to the original format don't affect cells, rows or
+        # columns that have already been written. Snapshots with identical
+        # properties are shared, to avoid duplicate style records.
+        if cell_format is None:
+            return None
+
+        # Compute the key from the format's current properties, ignoring
+        # any cached key, so that formats with different properties are
+        # never merged due to a stale _format_key.
+        key = cell_format._compute_format_key()
+
+        snapshot = self.format_snapshots.get(key)
+
+        if snapshot is None:
+            snapshot = cell_format._snapshot()
+            snapshot._format_key = key
+            self.format_snapshots[key] = snapshot
+            self.formats.append(snapshot)
+
+        return snapshot
 
     def _prepare_formats(self) -> None:
         # Iterate through the XF Format objects and separate them into

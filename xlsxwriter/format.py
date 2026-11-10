@@ -8,6 +8,7 @@
 #
 
 # Package imports.
+import copy
 from typing import Literal, Union
 from warnings import warn
 
@@ -1176,25 +1177,58 @@ class Format(xmlwriter.XMLwriter):
 
         return attributes
 
+    def _compute_format_key(self):
+        # Compute a unique hash key for the format's current properties.
+        # Unlike _get_format_key() this doesn't use or set the cached key.
+        return ":".join(
+            str(x)
+            for x in (
+                self._get_font_key(),
+                self._get_border_key(),
+                self._get_fill_key(),
+                self._get_alignment_key(),
+                self.num_format,
+                self.locked,
+                self.checkbox,
+                self.quote_prefix,
+                self.hidden,
+            )
+        )
+
     def _get_format_key(self):
         # Returns a unique hash key for a format. Used by Workbook.
         if self._format_key is None:
-            self._format_key = ":".join(
-                str(x)
-                for x in (
-                    self._get_font_key(),
-                    self._get_border_key(),
-                    self._get_fill_key(),
-                    self._get_alignment_key(),
-                    self.num_format,
-                    self.locked,
-                    self.checkbox,
-                    self.quote_prefix,
-                    self.hidden,
-                )
-            )
+            self._format_key = self._compute_format_key()
 
         return self._format_key
+
+    def _snapshot(self):
+        # Create a copy of the format with its current properties, but
+        # without any cached style indices or keys, so that subsequent
+        # changes to the original format don't affect cells, rows or
+        # columns that already reference the snapshot. The original format
+        # object isn't modified and can still be edited by the caller.
+        snapshot = copy.copy(self)
+
+        snapshot.xf_index = None
+        snapshot.dxf_index = None
+        snapshot._format_key = None
+
+        snapshot.font_index = 0
+        snapshot.has_font = False
+        snapshot.has_dxf_font = False
+
+        snapshot.fill_index = 0
+        snapshot.fill_count = 0
+        snapshot.has_fill = False
+        snapshot.has_dxf_fill = False
+
+        snapshot.border_index = 0
+        snapshot.border_count = 0
+        snapshot.has_border = False
+        snapshot.has_dxf_border = False
+
+        return snapshot
 
     def _get_font_key(self):
         # Returns a unique hash key for a font. Used by Workbook.
