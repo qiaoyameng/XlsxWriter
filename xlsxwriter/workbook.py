@@ -40,6 +40,7 @@ from xlsxwriter.exceptions import (
     FileSizeError,
     InvalidWorksheetName,
     ThemeFileError,
+    XlsxInputError,
 )
 from xlsxwriter.format import Format
 from xlsxwriter.image import Image
@@ -96,6 +97,7 @@ class Workbook(xmlwriter.XMLwriter):
         self.use_future_functions = options.get("use_future_functions", False)
         self.default_row_height = options.get("default_row_height", 20)
         self.default_col_width = options.get("default_column_width", 64)
+        self.reproducible = options.get("reproducible", False)
         self.default_format_properties = options.get(
             "default_format_properties", {"font_name": "Calibri", "font_size": 11}
         )
@@ -134,6 +136,12 @@ class Workbook(xmlwriter.XMLwriter):
         self.custom_colors = []
         self.doc_properties = {}
         self.custom_properties = []
+
+        # Allow the document creation date to be set explicitly. This is
+        # required in 'reproducible' mode.
+        if "created" in options:
+            self.doc_properties["created"] = options["created"]
+
         self.num_vml_files = 0
         self.num_comment_files = 0
         self.x_window = 240
@@ -840,6 +848,12 @@ class Workbook(xmlwriter.XMLwriter):
 
     def _store_workbook(self) -> None:
         # pylint: disable=consider-using-with
+        # Prepare the workbook for deterministic output before any files
+        # are created, so that unsupported features are reported before
+        # the workbook is closed.
+        if self.reproducible:
+            self._prepare_reproducible()
+
         # Create the xlsx/zip file.
         xlsx_file = ZipFile(
             self.filename,
@@ -1691,7 +1705,185 @@ class Workbook(xmlwriter.XMLwriter):
 
     def _prepare_sst_string_data(self) -> None:
         # Convert the SST string data from a dict to a list.
-        self.str_table._sort_string_data()
+        if self.reproducible:
+            # Sort the shared strings into a deterministic content based
+            # order and remap the string indices stored in the worksheet
+            # cells. The guard ensures this is only done once.
+            if self.str_table.string_table:
+                mapping = self.str_table._sort_string_data_reproducible()
+
+                for worksheet in self.worksheets():
+                    if not worksheet.is_chartsheet:
+                        worksheet._remap_shared_string_indices(mapping)
+        else:
+            self.str_table._sort_string_data()
+
+    def _prepare_reproducible(self) -> None:
+        # Prepare the workbook for deterministic, reproducible output in
+        # 'reproducible' mode.
+        self._check_reproducible_support()
+        self._prepare_reproducible_formats()
+        self._prepare_reproducible_tables()
+
+    def _check_reproducible_support(self) -> None:
+        # Check that the workbook only contains features that can be
+        # written deterministically and that the required options are set.
+        if not isinstance(self.doc_properties.get("created"), datetime):
+            raise XlsxInputError(
+                "The 'reproducible' mode requires an explicit document "
+                "creation date. Pass a datetime with the 'created' option, "
+                "for example Workbook(filename, {'reproducible': True, "
+                "'created': datetime(2024, 1, 1)}), or set it with "
+                "set_properties({'created': ...})."
+            )
+
+        unsupported = []
+
+        def _add_unsupported(feature):
+            if feature not in unsupported:
+                unsupported.append(feature)
+
+        if self.constant_memory:
+            _add_unsupported("constant_memory mode")
+
+        if self.charts:
+            _add_unsupported("charts")
+
+        if self.vba_project:
+            _add_unsupported("VBA projects")
+
+        if self.embedded_images.has_images():
+            _add_unsupported("embedded images")
+
+        if self.feature_property_bags:
+            _add_unsupported("checkboxes")
+
+        for worksheet in self.worksheets():
+            if worksheet.is_chartsheet:
+                _add_unsupported("chartsheets")
+
+            if worksheet.images:
+                _add_unsupported("images")
+
+            if worksheet.header_images or worksheet.footer_images:
+                _add_unsupported("header/footer images")
+
+            if worksheet.background_image:
+                _add_unsupported("background images")
+
+            if worksheet.comments:
+                _add_unsupported("comments")
+
+            if worksheet.buttons_list:
+                _add_unsupported("buttons")
+
+            if worksheet.shapes:
+                _add_unsupported("textboxes")
+
+            if worksheet.sparklines:
+                _add_unsupported("sparklines")
+
+        if unsupported:
+            raise XlsxInputError(
+                "The following features aren't supported in 'reproducible' "
+                "mode: " + ", ".join(unsupported) + "."
+            )
+
+    def _prepare_reproducible_formats(self) -> None:
+        # Assign XF and DXF format indices in a deterministic, content
+        # based order so that the output doesn't depend on the order in
+        # which the Format objects were created or used.
+
+        # Collect the formats that are used by worksheet cells, rows and
+        # columns, in addition to any formats with pre-assigned indices
+        # such as the default format.
+        used_formats = []
+        seen_formats = set()
+
+        def _add_used_format(cell_format):
+            if cell_format is not None and id(cell_format) not in seen_formats:
+                seen_formats.add(id(cell_format))
+                used_formats.append(cell_format)
+
+        for worksheet in self.worksheets():
+            if worksheet.is_chartsheet:
+                continue
+
+            for row_data in worksheet.table.values():
+                for cell in row_data.values():
+                    _add_used_format(cell.format)
+
+            for row_info in worksheet.row_info.values():
+                _add_used_format(row_info.row_format)
+
+            for col_info in worksheet.col_info.values():
+                _add_used_format(col_info.column_format)
+
+        for cell_format in self.formats:
+            if cell_format.xf_index is not None:
+                _add_used_format(cell_format)
+
+        # Reset the XF indices. Formats with a pre-assigned index of 0,
+        # such as the default format, keep their index.
+        self.xf_format_indices.clear()
+
+        for cell_format in self.formats:
+            if cell_format.xf_index != 0:
+                cell_format.xf_index = None
+
+        # Assign indices to the used formats in a sorted, content based
+        # order. Formats with identical properties share the same index,
+        # as in the standard Format._get_xf_index() logic.
+        index = 1
+
+        for cell_format in sorted(used_formats, key=Format._get_format_key):
+            if cell_format.xf_index is not None:
+                continue
+
+            key = cell_format._get_format_key()
+
+            if key in self.xf_format_indices:
+                continue
+
+            self.xf_format_indices[key] = index
+            cell_format.xf_index = index
+            index += 1
+
+        # Renumber the DXF formats used by conditional formats and tables
+        # into a deterministic content based order.
+        old_dxf_indices = dict(self.dxf_format_indices)
+        dxf_formats = [
+            xf_format for xf_format in self.formats if xf_format.dxf_index is not None
+        ]
+
+        self.dxf_format_indices.clear()
+
+        old_to_new = {}
+        dxf_keys = sorted({xf_format._get_format_key() for xf_format in dxf_formats})
+
+        for new_index, key in enumerate(dxf_keys):
+            self.dxf_format_indices[key] = new_index
+            old_to_new[old_dxf_indices[key]] = new_index
+
+        for xf_format in dxf_formats:
+            xf_format.dxf_index = self.dxf_format_indices[xf_format._get_format_key()]
+
+        # Remap the DXF indices stored in the worksheet conditional
+        # formats and tables.
+        if any(old_index != new_index for old_index, new_index in old_to_new.items()):
+            for worksheet in self.worksheets():
+                if not worksheet.is_chartsheet:
+                    worksheet._remap_dxf_indices(old_to_new)
+
+    def _prepare_reproducible_tables(self) -> None:
+        # Sort the worksheet tables into range order so that the table
+        # ids and default names don't depend on the order in which the
+        # tables were created.
+        for worksheet in self.worksheets():
+            if worksheet.tables:
+                worksheet.tables.sort(
+                    key=lambda table: xl_cell_to_rowcol(table["range"].split(":")[0])
+                )
 
     def _get_packager(self):
         # Get and instance of the Packager class to create the xlsx package.

@@ -136,3 +136,16 @@ class SharedStringTable:
         """ " Sort the shared string data and convert from dict to list."""
         self.string_array = sorted(self.string_table, key=self.string_table.__getitem__)
         self.string_table = {}
+
+    def _sort_string_data_reproducible(self):
+        """Sort the shared strings into a deterministic content based
+        order and return a mapping of the old indices to the new ones."""
+        self.string_array = sorted(self.string_table)
+
+        mapping = {}
+        for new_index, string in enumerate(self.string_array):
+            mapping[self.string_table[string]] = new_index
+
+        self.string_table = {}
+
+        return mapping

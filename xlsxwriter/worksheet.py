@@ -5981,6 +5981,29 @@ class Worksheet(xmlwriter.XMLwriter):
             ["/vmlDrawing", "../drawings/vmlDrawing" + str(vml_drawing_id) + ".vml"]
         )
 
+    def _remap_shared_string_indices(self, mapping) -> None:
+        # Remap the shared string indices stored in string cells after
+        # the shared string table has been sorted into a deterministic
+        # order. Used in 'reproducible' mode.
+        for row_data in self.table.values():
+            for col_num, cell in row_data.items():
+                if cell.__class__.__name__ in ("String", "RichString"):
+                    row_data[col_num] = cell._replace(string=mapping[cell.string])
+
+    def _remap_dxf_indices(self, mapping) -> None:
+        # Remap the dxf format indices stored in conditional formats and
+        # tables after the dxf formats have been sorted into a
+        # deterministic order. Used in 'reproducible' mode.
+        for options_list in self.cond_formats.values():
+            for options in options_list:
+                if options.get("format") is not None:
+                    options["format"] = mapping[options["format"]]
+
+        for table in self.tables:
+            for col_data in table.get("columns", []):
+                if col_data and col_data.get("format") is not None:
+                    col_data["format"] = mapping[col_data["format"]]
+
     def _prepare_tables(self, table_id, seen) -> None:
         # Set the table ids for the worksheet tables.
         for table in self.tables:
