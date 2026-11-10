@@ -40,11 +40,13 @@ from xlsxwriter.exceptions import (
     FileSizeError,
     InvalidWorksheetName,
     ThemeFileError,
+    ThreadedCommentPersonError,
 )
 from xlsxwriter.format import Format
 from xlsxwriter.image import Image
 from xlsxwriter.packager import Packager
 from xlsxwriter.sharedstrings import SharedStringTable
+from xlsxwriter.threaded_comments import PersonType
 from xlsxwriter.theme import THEME_XML_2007, THEME_XML_2023
 from xlsxwriter.utility import _has_invalid_name_chars, _utf16_len, xl_cell_to_rowcol
 from xlsxwriter.worksheet import Worksheet
@@ -136,6 +138,10 @@ class Workbook(xmlwriter.XMLwriter):
         self.custom_properties = []
         self.num_vml_files = 0
         self.num_comment_files = 0
+        self.num_threaded_comment_files = 0
+        self.persons: List[PersonType] = []
+        self.person_ids: Dict[PersonType, int] = {}
+        self.has_threaded_comments = False
         self.x_window = 240
         self.y_window = 15
         self.window_width = 16095
@@ -274,6 +280,33 @@ class Workbook(xmlwriter.XMLwriter):
             chartsheet_class = self.chartsheet_class
 
         return self._add_sheet(name, worksheet_class=chartsheet_class)
+
+    def add_person(
+        self,
+        name: str,
+        provider_id: str = "None",
+        user_id: str = "",
+    ) -> PersonType:
+        """
+        Add a person who can author threaded comments.
+
+        The same Person object is shared across worksheets and is written to
+        the workbook person list exactly once.
+
+        Args:
+            name:        The display name of the person.
+            provider_id: The identity provider, such as "None" or "AD".
+            user_id:     The optional user id within the provider.
+
+        Returns:
+            Reference to a PersonType object.
+
+        """
+        person = PersonType(name, provider_id, user_id)
+        self.person_ids[person] = len(self.persons)
+        self.persons.append(person)
+
+        return person
 
     def add_format(self, properties=None) -> Format:
         """
@@ -876,6 +909,9 @@ class Workbook(xmlwriter.XMLwriter):
 
         # Prepare the worksheet VML elements such as comments and buttons.
         self._prepare_vml()
+
+        # Prepare threaded comments and the workbook person list.
+        self._prepare_threaded_comments()
 
         # Set the defined names for the worksheets such as Print Titles.
         self._prepare_defined_names()
@@ -1555,6 +1591,31 @@ class Workbook(xmlwriter.XMLwriter):
 
             self.num_vml_files = vml_files
             self.num_comment_files = comment_files
+
+    def _prepare_threaded_comments(self) -> None:
+        # Validate threaded comment relationships, assign person and part
+        # indices and set up the worksheet relationship links.
+        threaded_comment_files = 0
+
+        for sheet in self.worksheets():
+            if not sheet.has_threaded_comments:
+                continue
+
+            # Every author must be declared as a workbook person.
+            for comment in sheet.threaded_comments_list:
+                if comment.person not in self.person_ids:
+                    raise ThreadedCommentPersonError(
+                        f"Threaded comment person '{comment.person.name}' "
+                        "must be added with workbook.add_person() first."
+                    )
+
+            threaded_comment_files += 1
+            sheet._prepare_threaded_comments(
+                threaded_comment_files, self.person_ids
+            )
+            self.has_threaded_comments = True
+
+        self.num_threaded_comment_files = threaded_comment_files
 
     def _prepare_tables(self) -> None:
         # Set the table ids for the worksheet tables.

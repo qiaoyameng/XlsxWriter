@@ -32,6 +32,7 @@ from xlsxwriter.sharedstrings import SharedStrings
 from xlsxwriter.styles import Styles
 from xlsxwriter.table import Table
 from xlsxwriter.theme import Theme
+from xlsxwriter.threaded_comments import PersonList, ThreadedComments
 from xlsxwriter.vml import Vml
 
 
@@ -101,6 +102,7 @@ class Packager:
         self.table_count = 0
         self.num_vml_files = 0
         self.num_comment_files = 0
+        self.num_threaded_comment_files = 0
         self.named_ranges = []
         self.filenames = []
 
@@ -125,6 +127,7 @@ class Packager:
         self.drawing_count = len(workbook.drawings)
         self.num_vml_files = workbook.num_vml_files
         self.num_comment_files = workbook.num_comment_files
+        self.num_threaded_comment_files = workbook.num_threaded_comment_files
         self.named_ranges = workbook.named_ranges
 
         for worksheet in self.workbook.worksheets():
@@ -145,6 +148,8 @@ class Packager:
         self._write_drawing_files()
         self._write_vml_files()
         self._write_comment_files()
+        self._write_threaded_comment_files()
+        self._write_person_list_file()
         self._write_table_files()
         self._write_shared_strings_file()
         self._write_styles_file()
@@ -296,6 +301,30 @@ class Packager:
             comment._set_xml_writer(self._filename("xl/comments" + str(index) + ".xml"))
             comment._assemble_xml_file(worksheet.comments_list)
             index += 1
+
+    def _write_threaded_comment_files(self) -> None:
+        # Write the threaded comment files.
+        for worksheet in self.workbook.worksheets():
+            if not worksheet.has_threaded_comments:
+                continue
+
+            index = worksheet.threaded_comments_list[0].file_index
+            threaded_comment = ThreadedComments()
+            threaded_comment._set_xml_writer(
+                self._filename(
+                    "xl/threadedComments/threadedComment" + str(index) + ".xml"
+                )
+            )
+            threaded_comment._assemble_xml_file(worksheet.threaded_comments_list)
+
+    def _write_person_list_file(self) -> None:
+        # Write the shared workbook person list file.
+        if not self.workbook.has_threaded_comments:
+            return
+
+        person_list = PersonList()
+        person_list._set_xml_writer(self._filename("xl/persons/person.xml"))
+        person_list._assemble_xml_file(self.workbook.persons)
 
     def _write_shared_strings_file(self) -> None:
         # Write the sharedStrings.xml file.
@@ -470,6 +499,12 @@ class Packager:
         for i in range(1, self.num_comment_files + 1):
             content._add_comment_name("comments" + str(i))
 
+        for i in range(1, self.num_threaded_comment_files + 1):
+            content._add_threaded_comment_name("threadedComment" + str(i))
+
+        if self.workbook.has_threaded_comments:
+            content._add_person_list_name()
+
         # Add the sharedString rel if there is string data in the workbook.
         if self.workbook.str_table.count:
             content._add_shared_strings()
@@ -619,6 +654,10 @@ class Packager:
         if self.workbook._has_feature_property_bags():
             rels._add_feature_bag_relationship()
 
+        # Add the shared person list if threaded comments are present.
+        if self.workbook.has_threaded_comments:
+            rels._add_person_list_relationship()
+
         rels._set_xml_writer(self._filename("xl/_rels/workbook.xml.rels"))
         rels._assemble_xml_file()
 
@@ -638,6 +677,7 @@ class Packager:
                 + worksheet.external_background_links
                 + worksheet.external_table_links
                 + worksheet.external_comment_links
+                + worksheet.external_threaded_comment_links
             )
 
             if not external_links:

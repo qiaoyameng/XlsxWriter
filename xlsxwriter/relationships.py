@@ -103,6 +103,15 @@ class Relationships(xmlwriter.XMLwriter):
         target = "featurePropertyBag/featurePropertyBag.xml"
         self.relationships.append((rel_type, target, None))
 
+    def _add_person_list_relationship(self) -> None:
+        # Add the workbook person list relationship.
+        rel_type = (
+            "http://schemas.microsoft.com/office/2017/10/relationships/"
+            "person"
+        )
+        target = "persons/person.xml"
+        self.relationships.append((rel_type, target, None))
+
     ###########################################################################
     #
     # XML methods.

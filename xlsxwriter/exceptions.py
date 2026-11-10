@@ -40,6 +40,22 @@ class OverlappingRange(XlsxInputError):
     """Worksheet merge range or table overlaps previous range."""
 
 
+class DuplicateThreadedCommentId(XlsxInputError):
+    """Threaded comment id already exists in the worksheet."""
+
+
+class ThreadedCommentParentError(XlsxInputError):
+    """Threaded comment parent id is missing or creates a cycle."""
+
+
+class ThreadedCommentConflict(XlsxInputError):
+    """Cell already contains a legacy comment or threaded comment."""
+
+
+class ThreadedCommentPersonError(XlsxInputError):
+    """Threaded comment author was not declared on the workbook."""
+
+
 class UndefinedImageSize(XlsxFileError):
     """No size data found in image file."""
 

@@ -122,6 +122,26 @@ class ContentTypes(xmlwriter.XMLwriter):
 
         self._add_override((comment_name, APP_DOCUMENT + "spreadsheetml.comments+xml"))
 
+    def _add_threaded_comment_name(self, comment_name: str) -> None:
+        # Add the name of a threaded comment to the ContentTypes overrides.
+        comment_name = "/xl/threadedComments/" + comment_name + ".xml"
+
+        self._add_override(
+            (
+                comment_name,
+                APP_DOCUMENT + "spreadsheetml.threadedComment+xml",
+            )
+        )
+
+    def _add_person_list_name(self) -> None:
+        # Add the person list to the ContentTypes overrides.
+        self._add_override(
+            (
+                "/xl/persons/person.xml",
+                APP_DOCUMENT + "spreadsheetml.person+xml",
+            )
+        )
+
     def _add_shared_strings(self) -> None:
         # Add the sharedStrings link to the ContentTypes overrides.
         self._add_override(

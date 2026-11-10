@@ -41,10 +41,17 @@ from xlsxwriter.chart import Chart
 from xlsxwriter.color import Color
 from xlsxwriter.comments import CommentType
 from xlsxwriter.drawing import Drawing, DrawingInfo, DrawingTypes
-from xlsxwriter.exceptions import DuplicateTableName, OverlappingRange
+from xlsxwriter.exceptions import (
+    DuplicateThreadedCommentId,
+    DuplicateTableName,
+    OverlappingRange,
+    ThreadedCommentConflict,
+    ThreadedCommentParentError,
+)
 from xlsxwriter.format import Format
 from xlsxwriter.image import Image
 from xlsxwriter.shape import Shape
+from xlsxwriter.threaded_comments import PersonType, ThreadedCommentType
 from xlsxwriter.url import Url, UrlTypes
 from xlsxwriter.utility import (
     _datetime_to_excel_datetime,
@@ -434,6 +441,11 @@ class Worksheet(xmlwriter.XMLwriter):
         self.comments_list = []
         self.comments_author = ""
         self.comments_visible = False
+        self.has_threaded_comments = False
+        self.threaded_comments = defaultdict(dict)
+        self.threaded_comments_list = []
+        self.threaded_comment_ids = set()
+        self.external_threaded_comment_links = []
         self.vml_shape_id = 1024
         self.buttons_list = []
         self.vml_header_id = 0
@@ -1890,6 +1902,13 @@ class Worksheet(xmlwriter.XMLwriter):
         if _utf16_len(comment) > self.xls_strmax:
             return -2
 
+        # A cell can't carry both a legacy comment and a threaded comment.
+        if col in self.threaded_comments.get(row, {}):
+            raise ThreadedCommentConflict(
+                f"Cell {xl_rowcol_to_cell(row, col)} already contains a "
+                "threaded comment."
+            )
+
         self.has_vml = True
         self.has_comments = True
 
@@ -1898,6 +1917,126 @@ class Worksheet(xmlwriter.XMLwriter):
         self.comments[row][col] = comment
 
         return 0
+
+    @convert_cell_args
+    def add_threaded_comment(
+        self,
+        row: int,
+        col: int,
+        comment_id: str,
+        person: PersonType,
+        text: str,
+        date_time: Optional[datetime.datetime] = None,
+    ) -> Literal[0, -1]:
+        """
+        Add a root threaded comment to a worksheet cell.
+
+        Args:
+            row:        The cell row (zero indexed).
+            col:        The cell column (zero indexed).
+            comment_id: A stable, application defined, unique comment id.
+            person:     A workbook PersonType author of the comment.
+            text:       The comment text.
+            date_time:  An optional UTC timestamp for the comment.
+
+        Returns:
+            0:  Success.
+            -1: Row or column is out of worksheet bounds.
+
+        """
+        # Check that row and col are valid.
+        if self._check_dimensions(row, col):
+            return -1
+
+        self._store_threaded_comment(
+            row, col, comment_id, person, text, date_time, None
+        )
+
+        return 0
+
+    @convert_cell_args
+    def add_threaded_reply(
+        self,
+        row: int,
+        col: int,
+        comment_id: str,
+        person: PersonType,
+        text: str,
+        parent_id: str,
+        date_time: Optional[datetime.datetime] = None,
+    ) -> Literal[0, -1]:
+        """
+        Add a reply to a threaded comment conversation on a worksheet cell.
+
+        The parent comment may be added later, so replies can be submitted
+        before the root comment.
+
+        Args:
+            row:        The cell row (zero indexed).
+            col:        The cell column (zero indexed).
+            comment_id: A stable, application defined, unique comment id.
+            person:     A workbook PersonType author of the reply.
+            text:       The reply text.
+            parent_id:  The id of the parent comment in the same cell.
+            date_time:  An optional UTC timestamp for the reply.
+
+        Returns:
+            0:  Success.
+            -1: Row or column is out of worksheet bounds.
+
+        """
+        # Check that row and col are valid.
+        if self._check_dimensions(row, col):
+            return -1
+
+        self._store_threaded_comment(
+            row, col, comment_id, person, text, date_time, parent_id
+        )
+
+        return 0
+
+    def _store_threaded_comment(
+        self,
+        row: int,
+        col: int,
+        comment_id: str,
+        person: PersonType,
+        text: str,
+        date_time: Optional[datetime.datetime],
+        parent_id: Optional[str],
+    ) -> None:
+        # Store a threaded comment or reply for processing on file close.
+        if not isinstance(comment_id, str) or not comment_id:
+            raise DuplicateThreadedCommentId(
+                "Threaded comment id must be a non-empty string."
+            )
+
+        if comment_id in self.threaded_comment_ids:
+            raise DuplicateThreadedCommentId(
+                f"Threaded comment id '{comment_id}' already exists in "
+                f"worksheet '{self.name}'."
+            )
+
+        if not isinstance(person, PersonType):
+            raise ThreadedCommentParentError(
+                "Threaded comment author must be a workbook Person object."
+            )
+
+        # A cell can't carry both a legacy comment and a threaded comment.
+        if col in self.comments.get(row, {}):
+            raise ThreadedCommentConflict(
+                f"Cell {xl_rowcol_to_cell(row, col)} already contains a "
+                "legacy comment."
+            )
+
+        comment = ThreadedCommentType(
+            row, col, comment_id, text, person, date_time, parent_id
+        )
+
+        self.has_threaded_comments = True
+        self.threaded_comment_ids.add(comment_id)
+        self.threaded_comments[row][col] = True
+        self.threaded_comments_list.append(comment)
 
     def show_comments(self) -> None:
         """
@@ -5979,6 +6118,66 @@ class Worksheet(xmlwriter.XMLwriter):
 
         self.external_vml_links.append(
             ["/vmlDrawing", "../drawings/vmlDrawing" + str(vml_drawing_id) + ".vml"]
+        )
+
+    def _prepare_threaded_comments(
+        self, threaded_comment_id: int, person_ids: Dict[PersonType, int]
+    ) -> None:
+        # Validate the threaded comment relationships and link the worksheet
+        # to its threadedComments part. Relationships are validated at close
+        # time so that replies may be submitted before their root comment.
+        if not self.has_threaded_comments:
+            return
+
+        comments_by_id = {}
+        comments_by_cell = defaultdict(set)
+
+        for comment in self.threaded_comments_list:
+            comments_by_id[comment.id] = comment
+            comments_by_cell[(comment.row, comment.col)].add(comment.id)
+
+        # Check that every parent exists, lives in the same cell and that no
+        # parent chain contains a cycle.
+        for comment in self.threaded_comments_list:
+            if comment.parent_id is None:
+                continue
+
+            parent = comments_by_id.get(comment.parent_id)
+            if parent is None:
+                raise ThreadedCommentParentError(
+                    f"Threaded comment '{comment.id}' references missing "
+                    f"parent '{comment.parent_id}'."
+                )
+
+            if comment.parent_id not in comments_by_cell[(comment.row, comment.col)]:
+                raise ThreadedCommentParentError(
+                    f"Threaded comment '{comment.id}' parent "
+                    f"'{comment.parent_id}' belongs to a different cell."
+                )
+
+            ancestor = parent
+            seen = {comment.id}
+            while ancestor is not None:
+                if ancestor.id in seen:
+                    raise ThreadedCommentParentError(
+                        f"Threaded comment parent chain for '{comment.id}' "
+                        "contains a cycle."
+                    )
+                seen.add(ancestor.id)
+                ancestor = comments_by_id.get(ancestor.parent_id)
+
+        # Assign workbook person ids and the threaded comment part index.
+        for comment in self.threaded_comments_list:
+            comment.person_id = person_ids[comment.person]
+            comment.file_index = threaded_comment_id
+
+        self.external_threaded_comment_links.append(
+            [
+                "/threadedComment",
+                "../threadedComments/threadedComment"
+                + str(threaded_comment_id)
+                + ".xml",
+            ]
         )
 
     def _prepare_tables(self, table_id, seen) -> None:
